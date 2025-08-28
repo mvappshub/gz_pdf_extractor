@@ -46,3 +46,6 @@ docs/
 .idea/
 *.DS_Store
 .bevel/do_not_share
+
+output-pdf/
+docs\spec/

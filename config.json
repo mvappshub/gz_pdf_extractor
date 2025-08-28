@@ -1,0 +1,26 @@
+{
+  "openrouter": {
+    "api_key": "",
+    "model": "google/gemini-2.5-flash",
+    "max_tokens": 4096,
+    "temperature": 0.0
+  },
+  "processing": {
+    "input_directory": "C:/gz_projekt/data-for-testing",
+    "output_directory": "C:/Users/marti/Desktop/gz_pdf_extractor/output-pdf",
+    "max_workers": 4,
+    "max_file_size_mb": 1000,
+    "skip_processed": true
+  },
+  "pdf": {
+    "max_pages": 50,
+    "min_text_length": 100,
+    "language": "en"
+  },
+  "advanced": {
+    "timeout_seconds": 30,
+    "retry_attempts": 3,
+    "log_level": "INFO",
+    "save_extracted_text": false
+  }
+}
