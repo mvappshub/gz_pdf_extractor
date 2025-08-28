@@ -155,16 +155,23 @@ class ConfigManager:
             return self.config
         
         # Načte konfiguraci ze souboru
-        config_data = self._load_config_file(self.config_path)
-        
-        # Rozšíří environment proměnné
-        config_data = self._expand_env_variables(config_data)
-        
-        # Vytvoří a validuje konfiguraci
-        self.config = AppConfig(**config_data)
-        self.config.validate_references()
-        
-        return self.config
+        try:
+            config_data = self._load_config_file(self.config_path)
+
+            # Rozšíří environment proměnné
+            config_data = self._expand_env_variables(config_data)
+
+            # Vytvoří a validuje konfiguraci
+            self.config = AppConfig(**config_data)
+            self.config.validate_references()
+
+            return self.config
+        except Exception as e:
+            # Při chybě načítání použije výchozí konfiguraci
+            print(f"Varování: Nepodařilo se načíst konfiguraci z {self.config_path}: {e}")
+            print("Používám výchozí konfiguraci.")
+            self.config = self._create_default_config()
+            return self.config
     
     def _find_config_file(self) -> Optional[str]:
         """Najde konfigurační soubor v aktuálním adresáři"""
@@ -272,7 +279,7 @@ class ConfigManager:
         if not path:
             path = f"config.{format}"
         
-        config_dict = self.config.dict()
+        config_dict = self.config.model_dump()
         
         with open(path, 'w', encoding='utf-8') as f:
             if format.lower() in ['yaml', 'yml']:
