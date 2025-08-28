@@ -48,4 +48,4 @@ docs/
 .bevel/do_not_share
 
 output-pdf/
-docs\spec/
+/docs/spec/
