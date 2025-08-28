@@ -2,8 +2,7 @@
 import os
 import json
 import argparse
-import base64 
-import pdfplumber# Nový import pro multimodální zpracování
+import pdfplumber  # Nový import pro multimodální zpracování
 import zipfile
 import io
 import re
@@ -11,7 +10,8 @@ import logging
 import logging.handlers
 import time
 import psutil
-from typing import List, Optional, Dict, Tuple, Any, Union
+import hashlib
+from typing import List, Optional, Dict, Tuple, Any
 from pydantic import BaseModel, Field, field_validator
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
     "input_directory": "C:/gz_projekt/data-for-testing",
     "output_directory": "C:/Users/marti/Desktop/pdf extractor/output-pdf",
     "max_workers": int(os.getenv("MAX_WORKERS", 5)), # Načítání z .env
-    "max_file_size_mb": 10, # Snížení limitu dle specifikace
+    "max_file_size_mb": 5000, # Snížení limitu dle specifikace
     "skip_processed": True
   },
   "pdf": {
@@ -84,54 +84,65 @@ METRICS = {
 
 # === NASTAVENÍ LOGOVÁNÍ ===
 def setup_logging(log_level="INFO", log_file=None):
-    """Nastavení strukturovaného logování s rotací souborů"""
+    """Nastavení strukturovaného logování bez konzole, pouze do JSONL"""
     logger = logging.getLogger()
     logger.setLevel(getattr(logging, log_level))
-    
-    # Odstranění existujících handlerů
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-    
-    # Formát pro JSON logování
-    formatter = logging.Formatter(
-        '{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s", "module": "%(module)s", "function": "%(funcName)s", "line": %(lineno)d}'
-    )
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # File handler s rotací (pokud je specifikován soubor)
+
+    # odstranit všechny existující handlery
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+
+    # JSONL handler ----------------------------------------------------------
+    class JSONLHandler(logging.Handler):
+        def __init__(self, filename):
+            super().__init__()
+            self.filename = filename
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        def emit(self, record):
+            try:
+                log_entry = {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "level": record.levelname,
+                    "message": record.getMessage(),
+                    "module": record.module,
+                    "function": record.funcName,
+                    "line": record.lineno
+                }
+                with open(self.filename, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            except Exception:
+                self.handleError(record)
+
+    # přidat JSONL handler
+    jsonl_handler = JSONLHandler("output-pdf/logs/logs.jsonl")
+    jsonl_handler.setFormatter(logging.Formatter())  # dummy
+    logger.addHandler(jsonl_handler)
+
+    # volitelný souborový handler (pokud chceš i klasický log)
     if log_file:
-        # Vytvoření adresáře pro logy, pokud neexistuje
-        log_dir = os.path.dirname(log_file)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-            
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=10*1024*1024, backupCount=5
+            log_file, maxBytes=10*1024*1024, backupCount=3
         )
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(logging.Formatter(
+            '{"timestamp":"%(asctime)s","level":"%(levelname)s","message":"%(message)s"}'
+        ))
         logger.addHandler(file_handler)
-    
+
     return logger
 
 # Načtení konfiguračního souboru
 def load_config(config_path=None):
     """Načtení konfigurace ze souboru nebo použití výchozí"""
-    print("DEBUG: Začínám načítat konfiguraci")
-    
     # Vytvoříme kopii výchozí konfigurace
     config = DEFAULT_CONFIG.copy()
-    print(f"DEBUG: Výchozí API klíč: {config['openrouter']['api_key']}")
-    
+
     # Pokud je poskytnut konfigurační soubor, pokusíme se ho načíst
     if config_path and os.path.exists(config_path):
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 file_config = json.load(f)
-                print(f"DEBUG: Načtená konfigurace ze souboru: {file_config}")
                 # Aktualizujeme výchozí konfiguraci hodnotami ze souboru
                 for section, values in file_config.items():
                     if section in config:
@@ -140,17 +151,13 @@ def load_config(config_path=None):
                         config[section] = values
         except Exception as e:
             logging.error(f"Chyba při načítání konfigurace ze souboru {config_path}: {str(e)}")
-    
+
     # Vynucení načtení API klíče z proměnných prostředí, pokud není nastaven
     if not config["openrouter"]["api_key"]:
-        env_api_key = os.getenv("OPENROUTER_API_KEY", "")
-        print(f"DEBUG: API klíč z proměnné prostředí: {env_api_key}")
-        if env_api_key:
+        if env_api_key := os.getenv("OPENROUTER_API_KEY", ""):
             config["openrouter"]["api_key"] = env_api_key
             logging.info("API klíč načten z proměnné prostředí")
-    
-    print(f"DEBUG: Finální API klíč: {config['openrouter']['api_key']}")
-    
+
     return config
 # === DATOVÉ MODELY (PYDANTIC) ===
 class TrackInfo(BaseModel):
@@ -194,24 +201,27 @@ def safe_print(message):
     with print_lock:
         print(message)
 
-def parse_duration(duration_str: str) -> int:
-    """Převede řetězec s dobou trvání na sekundy"""
+def parse_duration(duration_str: str) -> Optional[int]:
+    """Převede řetězec s dobou trvání na sekundy. Vrací None pro neplatný nebo prázdný vstup."""
     if not duration_str:
-        return 0
+        return None
+    parts = duration_str.split(':')
     try:
-        parts = duration_str.split(':')
         if len(parts) == 2:  # MM:SS
             return int(parts[0]) * 60 + int(parts[1])
         elif len(parts) == 3:  # HH:MM:SS
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    except:
-        pass
-    return 0
+        else:
+            return None
+    except (ValueError, TypeError):
+        return None
 
 def format_duration(seconds: int) -> str:
     """Formátuje sekundy jako MM:SS"""
+    if seconds < 0:
+        raise ValueError(f"Doba trvání nemůže být záporná: {seconds}")
     minutes = seconds // 60
-    seconds = seconds % 60
+    seconds %= 60
     return f"{minutes:02d}:{seconds:02d}"
 
 def normalize_duration_format(duration_str: str) -> str:
@@ -222,9 +232,9 @@ def normalize_duration_format(duration_str: str) -> str:
     """
     if not duration_str:
         return "00:00"
-    
+
     seconds = parse_duration(duration_str)
-    return format_duration(seconds)
+    return "00:00" if seconds is None else format_duration(seconds)
 
 def get_unique_path(path):
     """Generuje unikátní cestu k souboru přidáním _1, _2, atd."""
@@ -243,7 +253,7 @@ def get_cpu_usage():
     """Získá aktuální využití CPU"""
     try:
         return psutil.cpu_percent(interval=0.1)
-    except:
+    except Exception:
         return 0.0
 
 def log_error_jsonl(pdf_id, abs_path, error_msg, output_dir):
@@ -295,14 +305,30 @@ def extract_text_from_pdf(pdf_bytes, config):
             
             for i in range(pages_to_process):
                 page = pdf.pages[i]
-                page_text = page.extract_text()
-                if page_text:
+                if page_text := page.extract_text():
                     text += page_text + "\n"
     except Exception as e:
         logging.error(f"Chyba při extrakci textu z PDF: {str(e)}")
         raise
     
     return text
+
+def ensure_track_positions_are_integers(tracks):
+    """Ensure that all track positions are integers"""
+    for track in tracks:
+        if isinstance(track.position, str):
+            try:
+                track.position = int(track.position)
+            except ValueError:
+                track.position = 1  # Default fallback
+    return tracks
+
+def parse_and_validate_ai_response(json_content: str) -> AIResponse:
+    """Parse JSON content and validate with Pydantic model"""
+    parsed_data = json.loads(json_content)
+    ai_response = AIResponse(**parsed_data)
+    ensure_track_positions_are_integers(ai_response.tracks)
+    return ai_response
 
 def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[str, Any]]:
     """
@@ -361,23 +387,14 @@ def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[s
             # Parsování JSON odpovědi
             json_content = response.choices[0].message.content
             if not json_content:
-                raise Exception("Obdržena prázdná odpověď od AI poskytovatele")
+                raise ValueError("Obdržena prázdná odpověď od AI poskytovatele")
             
             # Logování odpovědi v DEBUG režimu
             logging.debug(f"AI Odpověď: {json_content}")
             
             # Pokus o parsování JSON a validace Pydantic modelem
             try:
-                parsed_data = json.loads(json_content)
-                ai_response = AIResponse(**parsed_data)
-                
-                # Zajištění, že position je integer
-                for track in ai_response.tracks:
-                    if isinstance(track.position, str):
-                        try:
-                            track.position = int(track.position)
-                        except ValueError:
-                            track.position = 1  # Default fallback
+                ai_response = parse_and_validate_ai_response(json_content)
                 
                 request_metrics["success"] = True
                 METRICS["successful_parses"] += 1
@@ -385,18 +402,18 @@ def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[s
                 return ai_response, request_metrics
             except (json.JSONDecodeError, ValueError) as e:
                 content_preview = json_content[:200] if json_content else "(prázdné)"
-                last_exception = Exception(f"Nepodařilo se zpracovat AI odpověď jako JSON: {e}. Odpověď: {content_preview}...")
+                last_exception = ValueError(f"Nepodařilo se zpracovat AI odpověď jako JSON: {e}. Odpověď: {content_preview}...")
                 logging.warning(f"Pokus o parsování {attempt + 1} selhal: {str(last_exception)}")
                 if attempt == retry_attempts - 1:
                     METRICS["failed_parses"] += 1
-                    raise last_exception
+                    raise last_exception from e
         
         except Exception as e:
             last_exception = e
             logging.warning(f"API volání pokus {attempt + 1} selhalo: {str(e)}")
             if attempt == retry_attempts - 1:
                 METRICS["failed_parses"] += 1
-                raise Exception(f"AI API volání selhalo po {retry_attempts} pokusech: {str(e)}")
+                raise RuntimeError(f"AI API volání selhalo po {retry_attempts} pokusech: {str(e)}")
             
             # Čekání před dalším pokusem (exponenciální backoff)
             wait_time = (2 ** attempt) * 1
@@ -404,21 +421,22 @@ def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[s
             time.sleep(wait_time)
     
     # Tento kód by nikdy neměl být dosažen, ale pro jistotu přidáme vyvolání výjimky
-    raise Exception("Neočekávaná chyba ve funkci fetch_structured_data_from_ai")
+    raise RuntimeError("Neočekávaná chyba ve funkci fetch_structured_data_from_ai")
 
 # === LOGIKA ZPRACOVÁNÍ A TRANSFORMACE DAT ===
 def calculate_side_durations(tracks: List[TrackInfo]) -> Dict[str, str]:
     """Vypočítá celkovou dobu trvání pro každou stranu"""
     side_durations_seconds = {}
-    
+
     for track in tracks:
         side = track.side
         duration_seconds = parse_duration(track.duration)
-        
+
         if side not in side_durations_seconds:
             side_durations_seconds[side] = 0
-        side_durations_seconds[side] += duration_seconds
-    
+        if duration_seconds is not None:
+            side_durations_seconds[side] += duration_seconds
+
     # Formátování výsledků
     return {side: format_duration(total) for side, total in side_durations_seconds.items()}
 
@@ -434,7 +452,11 @@ def transform_ai_response(ai_response: AIResponse, source_path: str) -> dict:
     for track in ai_response.tracks:
         duration_seconds = parse_duration(track.duration)
         duration_formatted = normalize_duration_format(track.duration)
-        
+
+        # Použití 0 jako fallback pro neplatné doby trvání
+        if duration_seconds is None:
+            duration_seconds = 0
+
         output_tracks.append(OutputTrack(
             title=track.title,
             side=track.side,
@@ -503,7 +525,7 @@ def collect_pdf_sources(config) -> List[Tuple[str, str, bytes]]:
     
     logging.info(f"Prohledávám adresář: {input_dir}")
     
-    for root, dirs, files in os.walk(input_dir):
+    for root, _, files in os.walk(input_dir):
         for file in files:
             file_path = os.path.join(root, file)
             abs_path = os.path.abspath(file_path)
@@ -545,18 +567,23 @@ def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, pro
     abs_path, pdf_id, pdf_bytes = pdf_data
     start_time = time.time()
     
-    # Vytvoření bezpečného názvu souboru z cesty
+    # Vytvoření bezpečného názvu souboru z cesty s hash pro jedinečnost
     safe_filename = pdf_id.replace('::', '_').replace('/', '_').replace('\\', '_')
-    output_file = os.path.splitext(safe_filename)[0] + ".json"
+    # Přidání hash pro zajištění jedinečnosti
+    pdf_hash = hashlib.md5(pdf_id.encode('utf-8')).hexdigest()[:8]
+    output_file = f"{os.path.splitext(safe_filename)[0]}_{pdf_hash}.json"
     base_output_path = os.path.join(output_dir, output_file)
     
     # Získání unikátní cesty
     output_path = get_unique_path(base_output_path)
     
-    # Kontrola, zda byl soubor již zpracován
-    if processed_files is not None and output_path in processed_files:
-        logging.info(f"Přeskakuji již zpracovaný soubor: {pdf_id}")
-        return None
+    # Kontrola, zda byl soubor již zpracován (kontrola podle pdf_id hash)
+    if processed_files is not None:
+        # Kontrola podle hash v názvu souboru místo přesné cesty
+        for processed_file in processed_files:
+            if pdf_hash in os.path.basename(processed_file):
+                logging.info(f"Přeskakuji již zpracovaný soubor: {pdf_id}")
+                return None
     
     logging.info(f"Zpracovávám: {pdf_id}")
     logging.debug(f"Zdrojová cesta: {abs_path}")
@@ -571,7 +598,7 @@ def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, pro
         
         # Uložení extrahovaného textu pro debugování (pokud je povoleno)
         if config["advanced"]["save_extracted_text"]:
-            debug_file = os.path.splitext(safe_filename)[0] + "_extrahovany_text.txt"
+            debug_file = f"{os.path.splitext(safe_filename)[0]}_extrahovany_text.txt"
             debug_path = os.path.join(output_dir, debug_file)
             with open(debug_path, 'w', encoding='utf-8') as f:
                 f.write(text)
@@ -673,8 +700,7 @@ def run_processing_pipeline(config):
         completed = 0
         for future in concurrent.futures.as_completed(futures):
             try:
-                result = future.result()
-                if result:
+                if result := future.result():
                     results.append(result)
                 completed += 1
                 
@@ -728,12 +754,6 @@ def run_processing_pipeline(config):
 
 # === HLAVNÍ SPUŠTĚCÍ BLOK ===
 def main():
-    # Dočasný kód pro ladění - smažte po vyřešení problému
-    print("Kontrola proměnných prostředí:")
-    print(f"OPENROUTER_API_KEY: {os.getenv('OPENROUTER_API_KEY')}")
-    print(f"OPENROUTER_MODEL: {os.getenv('OPENROUTER_MODEL')}")
-    print(f"MAX_WORKERS: {os.getenv('MAX_WORKERS')}")
-    print("-" * 50)
     
     parser = argparse.ArgumentParser(description='Extrakce informací o vinylových deskách z PDF souborů pomocí OpenRouter AI.')
     parser.add_argument('--config', '-c', help='Cesta ke konfiguračnímu souboru')
@@ -745,13 +765,7 @@ def main():
     
     # Načtení konfigurace
     config = load_config(args.config)
-    
-    # Dočasný kód pro ladění - zobrazení načtené konfigurace
-    print("Načtená konfigurace:")
-    print(f"API klíč: {'Nastaven' if config['openrouter']['api_key'] else 'Není nastaven'}")
-    print(f"Model: {config['openrouter']['model']}")
-    print(f"Max workers: {config['processing']['max_workers']}")
-    print("-" * 50)
+
     
     # Ověření, zda je nastaven API klíč
     if not config["openrouter"]["api_key"]:
@@ -760,7 +774,7 @@ def main():
         print("OPENROUTER_API_KEY=sk-vas-api-klic")
         return   
     # Nastavení logování
-    logger = setup_logging(args.log_level, args.log_file)
+    setup_logging(args.log_level, args.log_file)
     
     logging.info("=== Cue-AI Vinyl Record Extractor ===")
     logging.info(f"Vstupní adresář: {config['processing']['input_directory']}")

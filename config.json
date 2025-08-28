@@ -6,7 +6,7 @@
     "temperature": 0.0
   },
   "processing": {
-    "input_directory": "C:/gz_projekt/data-for-testing",
+    "input_directory": "F:/test-data",
     "output_directory": "C:/Users/marti/Desktop/gz_pdf_extractor/output-pdf",
     "max_workers": 4,
     "max_file_size_mb": 1000,
