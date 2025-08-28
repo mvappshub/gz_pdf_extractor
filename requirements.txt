@@ -3,3 +3,4 @@ python-dotenv
 openai
 pydantic
 psutil
+pyyaml

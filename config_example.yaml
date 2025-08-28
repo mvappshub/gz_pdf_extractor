@@ -1,0 +1,100 @@
+# Ukázkový konfigurační soubor pro multi-provider AI systém
+# Zkopírujte jako config.yaml a upravte podle potřeby
+
+# Konfigurace AI providerů
+providers:
+  # OpenRouter - cloudový AI provider
+  openrouter:
+    enabled: true
+    api_key: "${OPENROUTER_API_KEY}"  # Načte z environment proměnné
+    base_url: "https://openrouter.ai/api/v1"
+    timeout: 30
+    retry_attempts: 3
+    auto_discover_models: false
+    models:
+      - id: "google/gemini-2.5-flash"
+        name: "Gemini 2.5 Flash"
+        max_tokens: 4096
+        temperature: 0.0
+        cost_per_1k_tokens: 0.001
+        description: "Rychlý a efektivní model od Google"
+      
+      - id: "anthropic/claude-3-sonnet"
+        name: "Claude 3 Sonnet"
+        max_tokens: 4096
+        temperature: 0.0
+        cost_per_1k_tokens: 0.003
+        description: "Vysoce kvalitní model od Anthropic"
+      
+      - id: "meta-llama/llama-3.1-8b-instruct"
+        name: "Llama 3.1 8B Instruct"
+        max_tokens: 4096
+        temperature: 0.0
+        cost_per_1k_tokens: 0.0005
+        description: "Open source model od Meta"
+
+  # LM Studio - lokální AI provider
+  lm_studio:
+    enabled: true
+    api_key: "lm-studio"  # LM Studio používá tento placeholder
+    base_url: "http://localhost:1234/v1"
+    timeout: 60  # Lokální modely mohou být pomalejší
+    retry_attempts: 2
+    auto_discover_models: true  # Automaticky načte modely z LM Studio
+    models:
+      # Modely se načtou automaticky z LM Studio API
+      # Můžete zde definovat vlastní konfigurace pro konkrétní modely
+      - id: "llama-3.1-8b-instruct"
+        name: "Llama 3.1 8B Instruct (Local)"
+        max_tokens: 4096
+        temperature: 0.0
+        cost_per_1k_tokens: 0.0  # Lokální modely jsou zdarma
+        description: "Lokální Llama model"
+
+  # Ollama - další možný lokální provider (příklad)
+  ollama:
+    enabled: false  # Vypnuté ve výchozím stavu
+    api_key: "ollama"
+    base_url: "http://localhost:11434/v1"
+    timeout: 60
+    retry_attempts: 2
+    auto_discover_models: true
+    models: []
+
+# Výchozí nastavení
+defaults:
+  provider: "openrouter"  # Výchozí provider
+  model: "google/gemini-2.5-flash"  # Výchozí model
+  fallback_provider: "lm_studio"  # Záložní provider při selhání
+  fallback_model: "llama-3.1-8b-instruct"  # Záložní model
+
+# Konfigurace zpracování
+processing:
+  input_directory: "F:/test-data"  # Vstupní adresář s PDF soubory
+  output_directory: "./output-pdf"  # Výstupní adresář
+  max_workers: 4  # Počet paralelních vláken
+  max_file_size_mb: 1000  # Maximální velikost souboru v MB
+  skip_processed: true  # Přeskočit již zpracované soubory
+  batch_size: 10  # Velikost dávky pro zpracování
+
+# Konfigurace PDF zpracování
+pdf:
+  max_pages: 50  # Maximální počet stránek ke zpracování
+  min_text_length: 100  # Minimální délka extrahovaného textu
+  language: "en"  # Jazyk dokumentu
+  extract_images: false  # Zda extrahovat obrázky (pro budoucí multimodální zpracování)
+
+# Pokročilá nastavení
+advanced:
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  save_extracted_text: false  # Uložit extrahovaný text pro debugging
+  enable_metrics: true  # Povolit sledování metrik
+  enable_cost_tracking: true  # Sledovat náklady na tokeny
+  auto_retry_on_failure: true  # Automaticky opakovat při chybě
+
+# Poznámky k použití:
+# 1. Zkopírujte tento soubor jako config.yaml
+# 2. Nastavte OPENROUTER_API_KEY environment proměnnou
+# 3. Upravte cesty k adresářům podle vašeho systému
+# 4. Pro LM Studio spusťte server na portu 1234
+# 5. Povolte/zakažte providery podle potřeby
