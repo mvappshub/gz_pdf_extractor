@@ -36,6 +36,7 @@ class PdfExtractorGUI(tk.Tk):
         self.geometry("1400x800")
 
         self.config = load_config()
+        self.stop_event = threading.Event()
 
         # Hlavní horizontální rozdělení
         self.main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -202,7 +203,8 @@ class PdfExtractorGUI(tk.Tk):
 
     def run_processing(self):
         self.log_text.delete('1.0', tk.END)
-        
+        self.stop_event.clear()
+
         # Update config from GUI
         self.config['processing']['input_directory'] = self.input_dir_var.get()
         self.config['processing']['output_directory'] = self.output_dir_var.get()
@@ -221,7 +223,16 @@ class PdfExtractorGUI(tk.Tk):
 
     def processing_task(self):
         try:
-            run_processing_pipeline(self.config)
+            # Inicializace logování do souboru z backendu
+            log_dir = os.path.join(self.config['processing']['output_directory'], "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            # Použijeme setup_logging z importovaného modulu
+            setup_logging(
+                log_level=self.config['advanced']['log_level'],
+                log_file=os.path.join(log_dir, "processing.log")
+            )
+
+            run_processing_pipeline(self.config, stop_event=self.stop_event)
         except Exception as e:
             logging.error(f"Došlo k neočekávané chybě: {e}")
         finally:
@@ -232,21 +243,18 @@ class PdfExtractorGUI(tk.Tk):
             messagebox.showinfo("Hotovo", "Zpracování dokončeno.")
             
     def stop_processing(self):
-        # This is a simplified stop mechanism. It doesn't gracefully stop threads.
-        # For a real application, a more sophisticated mechanism would be needed.
-        logging.info("Zastavuji zpracování...")
-        # A simple way to stop is to exit the app. A better way would be to signal the thread to stop.
-        self.destroy()
+        logging.info("Signál k zastavení zpracování...")
+        self.stop_event.set()
+        self.stop_button.config(state=tk.DISABLED)
 
     def refresh_results(self):
         """Načte a zobrazí výsledky ze všech JSON souborů"""
-        try:
-            # Vyčištění tabulek
-            for item in self.sides_tree.get_children():
-                self.sides_tree.delete(item)
-            for item in self.tracks_tree.get_children():
-                self.tracks_tree.delete(item)
+        # Spustí načítání v samostatném vlákně, aby GUI nezamrzlo
+        threading.Thread(target=self._load_results_task, daemon=True).start()
 
+    def _load_results_task(self):
+        """Tato metoda běží na pozadí"""
+        try:
             # Načtení dat z JSON souborů
             output_dir = self.config['processing']['output_directory']
             json_pattern = os.path.join(output_dir, "*.json")
@@ -288,6 +296,23 @@ class PdfExtractorGUI(tk.Tk):
             # Seřazení podle názvu PDF a strany
             sides_data.sort(key=lambda x: (x['pdf_name'], x['side']))
 
+            # Po dokončení naplánuj aktualizaci UI v hlavním vlákně
+            self.after(0, self._update_results_in_gui, sides_data)
+
+        except Exception as e:
+            logging.error(f"Chyba při načítání výsledků: {e}")
+            # Pro chyby také použijeme hlavní vlákno
+            self.after(0, lambda: messagebox.showerror("Chyba", f"Nepodařilo se načíst výsledky: {e}"))
+
+    def _update_results_in_gui(self, sides_data):
+        """Tato metoda běží v hlavním vlákně a je bezpečná pro UI"""
+        try:
+            # Vyčištění tabulek
+            for item in self.sides_tree.get_children():
+                self.sides_tree.delete(item)
+            for item in self.tracks_tree.get_children():
+                self.tracks_tree.delete(item)
+
             # Uložení dat pro pozdější použití
             self.sides_data = {i: side_data for i, side_data in enumerate(sides_data)}
 
@@ -301,11 +326,10 @@ class PdfExtractorGUI(tk.Tk):
                     side_data['track_count']
                 ), tags=(str(i),))
 
-            logging.info(f"Načteno {len(sides_data)} stran z {len(json_files)} JSON souborů")
-
+            logging.info(f"Zobrazeno {len(sides_data)} stran.")
         except Exception as e:
-            logging.error(f"Chyba při načítání výsledků: {e}")
-            messagebox.showerror("Chyba", f"Nepodařilo se načíst výsledky: {e}")
+            logging.error(f"Chyba při aktualizaci GUI: {e}")
+            messagebox.showerror("Chyba", f"Nepodařilo se aktualizovat zobrazení: {e}")
 
     def on_side_select(self, event):
         """Obsluha výběru strany - zobrazí tracky"""
@@ -331,10 +355,10 @@ class PdfExtractorGUI(tk.Tk):
             # Vložení tracků do spodní tabulky
             for track in tracks:
                 self.tracks_tree.insert('', 'end', values=(
-                    track.get('title', ''),
-                    track.get('position', ''),
-                    track.get('duration_seconds', ''),
-                    track.get('duration_formatted', '')
+                    track.get('title', 'N/A'),
+                    track.get('position', 'N/A'),
+                    track.get('duration_seconds', 'N/A'),
+                    track.get('duration_formatted', 'N/A')
                 ))
         except (ValueError, KeyError) as e:
             logging.warning(f"Chyba při načítání tracků: {e}")

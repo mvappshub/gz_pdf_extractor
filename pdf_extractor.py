@@ -67,6 +67,8 @@ DEFAULT_CONFIG = {
 print_lock = threading.Lock()
 # Zámek pro bezpečný zápis chyb
 error_log_lock = threading.Lock()
+# Zámek pro thread-safe aktualizace metrik
+metrics_lock = threading.Lock()
 
 # Globální proměnné pro metriky
 METRICS = {
@@ -88,15 +90,12 @@ def setup_logging(log_level="INFO", log_file=None):
     logger = logging.getLogger()
     logger.setLevel(getattr(logging, log_level))
 
-    # odstranit všechny existující handlery
-    for h in logger.handlers[:]:
-        logger.removeHandler(h)
-
     # JSONL handler ----------------------------------------------------------
     class JSONLHandler(logging.Handler):
         def __init__(self, filename):
             super().__init__()
             self.filename = filename
+            self._lock = threading.Lock()  # Thread-safe zápis do souboru
             os.makedirs(os.path.dirname(filename), exist_ok=True)
 
         def emit(self, record):
@@ -109,10 +108,20 @@ def setup_logging(log_level="INFO", log_file=None):
                     "function": record.funcName,
                     "line": record.lineno
                 }
-                with open(self.filename, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                with self._lock:  # Thread-safe zápis
+                    with open(self.filename, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
             except Exception:
                 self.handleError(record)
+
+    # Odstraníme pouze handlery, které sami přidáváme, abychom předešli duplikaci
+    from logging.handlers import RotatingFileHandler
+    handlers_to_remove = [
+        h for h in logger.handlers
+        if isinstance(h, (JSONLHandler, RotatingFileHandler))
+    ]
+    for h in handlers_to_remove:
+        logger.removeHandler(h)
 
     # přidat JSONL handler
     jsonl_handler = JSONLHandler("output-pdf/logs/logs.jsonl")
@@ -313,21 +322,12 @@ def extract_text_from_pdf(pdf_bytes, config):
     
     return text
 
-def ensure_track_positions_are_integers(tracks):
-    """Ensure that all track positions are integers"""
-    for track in tracks:
-        if isinstance(track.position, str):
-            try:
-                track.position = int(track.position)
-            except ValueError:
-                track.position = 1  # Default fallback
-    return tracks
+
 
 def parse_and_validate_ai_response(json_content: str) -> AIResponse:
     """Parse JSON content and validate with Pydantic model"""
     parsed_data = json.loads(json_content)
     ai_response = AIResponse(**parsed_data)
-    ensure_track_positions_are_integers(ai_response.tracks)
     return ai_response
 
 def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[str, Any]]:
@@ -378,9 +378,10 @@ def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[s
                 request_metrics["prompt_tokens"] = response.usage.prompt_tokens
                 request_metrics["response_tokens"] = response.usage.completion_tokens
                 
-                # Aktualizace globálních metrik
-                METRICS["total_tokens_used"] += request_metrics["prompt_tokens"]
-                METRICS["total_response_tokens"] += request_metrics["response_tokens"]
+                # Aktualizace globálních metrik (thread-safe)
+                with metrics_lock:
+                    METRICS["total_tokens_used"] += request_metrics["prompt_tokens"]
+                    METRICS["total_response_tokens"] += request_metrics["response_tokens"]
             else:
                 logging.warning("Informace o použití tokenu nejsou k dispozici")
             
@@ -397,7 +398,8 @@ def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[s
                 ai_response = parse_and_validate_ai_response(json_content)
                 
                 request_metrics["success"] = True
-                METRICS["successful_parses"] += 1
+                with metrics_lock:
+                    METRICS["successful_parses"] += 1
                 
                 return ai_response, request_metrics
             except (json.JSONDecodeError, ValueError) as e:
@@ -405,22 +407,25 @@ def fetch_structured_data_from_ai(text: str, config) -> Tuple[AIResponse, Dict[s
                 last_exception = ValueError(f"Nepodařilo se zpracovat AI odpověď jako JSON: {e}. Odpověď: {content_preview}...")
                 logging.warning(f"Pokus o parsování {attempt + 1} selhal: {str(last_exception)}")
                 if attempt == retry_attempts - 1:
-                    METRICS["failed_parses"] += 1
+                    with metrics_lock:
+                        METRICS["failed_parses"] += 1
                     raise last_exception from e
         
         except Exception as e:
             last_exception = e
             logging.warning(f"API volání pokus {attempt + 1} selhalo: {str(e)}")
             if attempt == retry_attempts - 1:
-                METRICS["failed_parses"] += 1
+                with metrics_lock:
+                    METRICS["failed_parses"] += 1
                 raise RuntimeError(f"AI API volání selhalo po {retry_attempts} pokusech: {str(e)}")
             
             # Čekání před dalším pokusem (exponenciální backoff)
             wait_time = (2 ** attempt) * 1
             logging.info(f"Čekám {wait_time}s před dalším pokusem...")
             time.sleep(wait_time)
-    
-    # Tento kód by nikdy neměl být dosažen, ale pro jistotu přidáme vyvolání výjimky
+
+    # Tento kód by neměl být nikdy dosažen díky raise v except bloku výše,
+    # ale type checker vyžaduje explicitní return/raise na konci funkce
     raise RuntimeError("Neočekávaná chyba ve funkci fetch_structured_data_from_ai")
 
 # === LOGIKA ZPRACOVÁNÍ A TRANSFORMACE DAT ===
@@ -453,8 +458,9 @@ def transform_ai_response(ai_response: AIResponse, source_path: str) -> dict:
         duration_seconds = parse_duration(track.duration)
         duration_formatted = normalize_duration_format(track.duration)
 
-        # Použití 0 jako fallback pro neplatné doby trvání
+        # Logování varování pro neplatné doby trvání místo tichého nastavování na 0
         if duration_seconds is None:
+            logging.warning(f"Neplatná doba trvání pro stopu '{track.title}' na straně {track.side}, pozice {track.position}: '{track.duration}'. Nastavuji na 0 sekund.")
             duration_seconds = 0
 
         output_tracks.append(OutputTrack(
@@ -562,10 +568,14 @@ def collect_pdf_sources(config) -> List[Tuple[str, str, bytes]]:
     logging.info(f"Nalezeno {len(pdf_files)} PDF souborů ke zpracování")
     return pdf_files
 
-def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, processed_files=None) -> Optional[Dict[str, Any]]:
+def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, processed_files=None, stop_event: Optional[threading.Event] = None) -> Optional[Dict[str, Any]]:
     """Zpracování jednoho PDF souboru"""
     abs_path, pdf_id, pdf_bytes = pdf_data
     start_time = time.time()
+
+    if stop_event and stop_event.is_set():
+        logging.info(f"Zpracování souboru {pdf_id} přerušeno.")
+        return None
     
     # Vytvoření bezpečného názvu souboru z cesty s hash pro jedinečnost
     safe_filename = pdf_id.replace('::', '_').replace('/', '_').replace('\\', '_')
@@ -603,6 +613,11 @@ def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, pro
             with open(debug_path, 'w', encoding='utf-8') as f:
                 f.write(text)
         
+        # Kontrola zastavení před dlouhotrvající operací
+        if stop_event and stop_event.is_set():
+            logging.info(f"Zpracování souboru {pdf_id} přerušeno.")
+            return None
+
         # Extrakce dat pomocí AI
         ai_response, request_metrics = fetch_structured_data_from_ai(text, config)
         
@@ -615,9 +630,10 @@ def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, pro
         
         processing_time = time.time() - start_time
         
-        # Aktualizace metrik
-        METRICS["processed_files"] += 1
-        METRICS["total_processing_time"] += processing_time
+        # Aktualizace metrik (thread-safe)
+        with metrics_lock:
+            METRICS["processed_files"] += 1
+            METRICS["total_processing_time"] += processing_time
         
         logging.info(f"Úspěch: Data uložena do {output_path}")
         logging.debug(f"Skladby: {len(output_data['tracks'])} s daty o celkové době trvání")
@@ -634,8 +650,9 @@ def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, pro
         
     except Exception as e:
         processing_time = time.time() - start_time
-        METRICS["failed_files"] += 1
-        METRICS["total_processing_time"] += processing_time
+        with metrics_lock:
+            METRICS["failed_files"] += 1
+            METRICS["total_processing_time"] += processing_time
         
         logging.error(f"Chyba při zpracování {pdf_id}: {str(e)}")
         
@@ -648,7 +665,7 @@ def process_single_pdf(pdf_data: Tuple[str, str, bytes], config, output_dir, pro
             "processing_time": processing_time,
             "error": str(e)
         }
-def run_processing_pipeline(config):
+def run_processing_pipeline(config, stop_event: Optional[threading.Event] = None):
     """
     Zpracování všech PDF souborů v zadaném adresáři paralelně
     """
@@ -684,8 +701,9 @@ def run_processing_pipeline(config):
         logging.warning(f"Nebyly nalezeny žádné PDF soubory v '{input_dir}'.")
         return
     
-    METRICS["total_files"] = len(pdf_files)
-    METRICS["start_time"] = datetime.now()
+    with metrics_lock:
+        METRICS["total_files"] = len(pdf_files)
+        METRICS["start_time"] = datetime.now()
     
     logging.info(f"Nalezeno {len(pdf_files)} PDF souborů ke zpracování (sběr trval {collection_time:.2f} sekund).")
     logging.info(f"Zpracovávám s {max_workers} paralelními vlákny...")
@@ -694,28 +712,37 @@ def run_processing_pipeline(config):
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Vytvoření úloh pro každé PDF
-        futures = [executor.submit(process_single_pdf, pdf_data, config, output_dir, processed_files) for pdf_data in pdf_files]
-        
+        futures = [executor.submit(process_single_pdf, pdf_data, config, output_dir, processed_files, stop_event) for pdf_data in pdf_files]
+
         # Sledování průběhu
         completed = 0
         for future in concurrent.futures.as_completed(futures):
+            if stop_event and stop_event.is_set():
+                logging.warning("Zpracování přerušeno uživatelem.")
+                # Zrušení zbývajících úkolů
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
+                break
+
             try:
                 if result := future.result():
                     results.append(result)
                 completed += 1
-                
+
                 # Aktualizace průběhu
                 progress = (completed / len(pdf_files)) * 100
                 cpu_usage = get_cpu_usage()
-                
+
                 logging.info(f"Průběh: {completed}/{len(pdf_files)} ({progress:.1f}%), CPU: {cpu_usage:.1f}%")
-                
+
             except Exception as e:
                 logging.error(f"Neočekávaná chyba ve vlákně: {str(e)}")
     
-    METRICS["end_time"] = datetime.now()
-    
-    # Výpočet celkových metrik
+    with metrics_lock:
+        METRICS["end_time"] = datetime.now()
+
+    # Výpočet celkových metrik (čtení je thread-safe)
     total_time = (METRICS["end_time"] - METRICS["start_time"]).total_seconds()
     avg_time_per_file = METRICS["total_processing_time"] / max(METRICS["processed_files"], 1)
     
